@@ -1,21 +1,25 @@
+import http.server
 import os
+import re
 import shutil
 import textwrap
 from hashlib import sha256
 from pathlib import Path
-from typing import List
+from typing import Callable, List, Tuple
 
 import pytest
 
 from pip._internal.cli.status_codes import ERROR
-from tests.conftest import MockServer, ScriptFactory
+from pip._internal.utils.urls import path_to_url
 from tests.lib import (
     PipTestEnvironment,
+    ScriptFactory,
     TestData,
+    TestPipResult,
     create_basic_sdist_for_package,
     create_really_basic_wheel,
 )
-from tests.lib.server import file_response
+from tests.lib.server import MockServer, file_response
 
 
 def fake_wheel(data: TestData, wheel_path: str) -> None:
@@ -652,7 +656,6 @@ def make_wheel_with_python_requires(
     return package_dir / "dist" / file_name
 
 
-@pytest.mark.usefixtures("with_wheel")
 def test_download__python_version_used_for_python_requires(
     script: PipTestEnvironment, data: TestData
 ) -> None:
@@ -693,7 +696,6 @@ def test_download__python_version_used_for_python_requires(
     script.pip(*args)  # no exception
 
 
-@pytest.mark.usefixtures("with_wheel")
 def test_download_ignore_requires_python_dont_fail_with_wrong_python(
     script: PipTestEnvironment,
 ) -> None:
@@ -1116,9 +1118,17 @@ def test_download_file_url_existing_bad_download(
     simple_pkg_bytes = simple_pkg.read_bytes()
     url = f"{simple_pkg.as_uri()}#sha256={sha256(simple_pkg_bytes).hexdigest()}"
 
-    shared_script.pip("download", "-d", str(download_dir), url)
+    result = shared_script.pip(
+        "download",
+        "-d",
+        str(download_dir),
+        url,
+        allow_stderr_warning=True,  # bad hash
+    )
 
     assert simple_pkg_bytes == downloaded_path.read_bytes()
+    assert "WARNING: Previously-downloaded file" in result.stderr
+    assert "has bad hash. Re-downloading." in result.stderr
 
 
 def test_download_http_url_bad_hash(
@@ -1144,9 +1154,17 @@ def test_download_http_url_bad_hash(
     base_address = f"http://{mock_server.host}:{mock_server.port}"
     url = f"{base_address}/simple-1.0.tar.gz#sha256={digest}"
 
-    shared_script.pip("download", "-d", str(download_dir), url)
+    result = shared_script.pip(
+        "download",
+        "-d",
+        str(download_dir),
+        url,
+        allow_stderr_warning=True,  # bad hash
+    )
 
     assert simple_pkg_bytes == downloaded_path.read_bytes()
+    assert "WARNING: Previously-downloaded file" in result.stderr
+    assert "has bad hash. Re-downloading." in result.stderr
 
     mock_server.stop()
     requests = mock_server.get_requests()
@@ -1214,3 +1232,244 @@ def test_download_use_pep517_propagation(
 
     downloads = os.listdir(download_dir)
     assert len(downloads) == 2
+
+
+@pytest.fixture(scope="function")
+def download_local_html_index(
+    script: PipTestEnvironment,
+    html_index_for_packages: Path,
+    tmpdir: Path,
+) -> Callable[..., Tuple[TestPipResult, Path]]:
+    """Execute `pip download` against a generated PyPI index."""
+    download_dir = tmpdir / "download_dir"
+
+    def run_for_generated_index(
+        args: List[str],
+        allow_error: bool = False,
+    ) -> Tuple[TestPipResult, Path]:
+        """
+        Produce a PyPI directory structure pointing to the specified packages, then
+        execute `pip download -i ...` pointing to our generated index.
+        """
+        pip_args = [
+            "download",
+            "-d",
+            str(download_dir),
+            "-i",
+            path_to_url(str(html_index_for_packages)),
+            *args,
+        ]
+        result = script.pip(*pip_args, allow_error=allow_error)
+        return (result, download_dir)
+
+    return run_for_generated_index
+
+
+@pytest.fixture(scope="function")
+def download_server_html_index(
+    script: PipTestEnvironment,
+    tmpdir: Path,
+    html_index_with_onetime_server: http.server.ThreadingHTTPServer,
+) -> Callable[..., Tuple[TestPipResult, Path]]:
+    """Execute `pip download` against a generated PyPI index."""
+    download_dir = tmpdir / "download_dir"
+
+    def run_for_generated_index(
+        args: List[str],
+        allow_error: bool = False,
+    ) -> Tuple[TestPipResult, Path]:
+        """
+        Produce a PyPI directory structure pointing to the specified packages, then
+        execute `pip download -i ...` pointing to our generated index.
+        """
+        pip_args = [
+            "download",
+            "-d",
+            str(download_dir),
+            "-i",
+            "http://localhost:8000",
+            *args,
+        ]
+        result = script.pip(*pip_args, allow_error=allow_error)
+        return (result, download_dir)
+
+    return run_for_generated_index
+
+
+@pytest.mark.parametrize(
+    "requirement_to_download, expected_outputs",
+    [
+        ("simple2==1.0", ["simple-1.0.tar.gz", "simple2-1.0.tar.gz"]),
+        ("simple==2.0", ["simple-2.0.tar.gz"]),
+        (
+            "colander",
+            ["colander-0.9.9-py2.py3-none-any.whl", "translationstring-1.1.tar.gz"],
+        ),
+        (
+            "compilewheel",
+            ["compilewheel-1.0-py2.py3-none-any.whl", "simple-1.0.tar.gz"],
+        ),
+    ],
+)
+def test_download_metadata(
+    download_local_html_index: Callable[..., Tuple[TestPipResult, Path]],
+    requirement_to_download: str,
+    expected_outputs: List[str],
+) -> None:
+    """Verify that if a data-dist-info-metadata attribute is present, then it is used
+    instead of the actual dist's METADATA."""
+    _, download_dir = download_local_html_index(
+        [requirement_to_download],
+    )
+    assert sorted(os.listdir(download_dir)) == expected_outputs
+
+
+@pytest.mark.parametrize(
+    "requirement_to_download, expected_outputs, doubled_path",
+    [
+        (
+            "simple2==1.0",
+            ["simple-1.0.tar.gz", "simple2-1.0.tar.gz"],
+            "/simple2/simple2-1.0.tar.gz",
+        ),
+        ("simple==2.0", ["simple-2.0.tar.gz"], "/simple/simple-2.0.tar.gz"),
+        (
+            "colander",
+            ["colander-0.9.9-py2.py3-none-any.whl", "translationstring-1.1.tar.gz"],
+            "/colander/colander-0.9.9-py2.py3-none-any.whl",
+        ),
+        (
+            "compilewheel",
+            [
+                "compilewheel-1.0-py2.py3-none-any.whl",
+                "simple-1.0.tar.gz",
+            ],
+            "/compilewheel/compilewheel-1.0-py2.py3-none-any.whl",
+        ),
+    ],
+)
+def test_download_metadata_server(
+    download_server_html_index: Callable[..., Tuple[TestPipResult, Path]],
+    requirement_to_download: str,
+    expected_outputs: List[str],
+    doubled_path: str,
+) -> None:
+    """Verify that if a data-dist-info-metadata attribute is present, then it is used
+    instead of the actual dist's METADATA.
+
+    Additionally, verify that each dist is downloaded exactly once using a mock server.
+
+    This is a regression test for issue https://github.com/pypa/pip/issues/11847.
+    """
+    _, download_dir = download_server_html_index(
+        [requirement_to_download, "--no-cache-dir"],
+    )
+    assert sorted(os.listdir(download_dir)) == expected_outputs
+    shutil.rmtree(download_dir)
+    result, _ = download_server_html_index(
+        [requirement_to_download, "--no-cache-dir"],
+        allow_error=True,
+    )
+    assert result.returncode != 0
+    expected_msg = f"File {doubled_path} not available more than once!"
+    assert expected_msg in result.stderr
+
+
+@pytest.mark.parametrize(
+    "requirement_to_download, real_hash",
+    [
+        (
+            "simple==3.0",
+            "95e0f200b6302989bcf2cead9465cf229168295ea330ca30d1ffeab5c0fed996",
+        ),
+        (
+            "has-script",
+            "16ba92d7f6f992f6de5ecb7d58c914675cf21f57f8e674fb29dcb4f4c9507e5b",
+        ),
+    ],
+)
+def test_incorrect_metadata_hash(
+    download_local_html_index: Callable[..., Tuple[TestPipResult, Path]],
+    requirement_to_download: str,
+    real_hash: str,
+) -> None:
+    """Verify that if a hash for data-dist-info-metadata is provided, it must match the
+    actual hash of the metadata file."""
+    result, _ = download_local_html_index(
+        [requirement_to_download],
+        allow_error=True,
+    )
+    assert result.returncode != 0
+    expected_msg = f"""\
+        Expected sha256 wrong-hash
+             Got        {real_hash}"""
+    assert expected_msg in result.stderr
+
+
+@pytest.mark.parametrize(
+    "requirement_to_download, expected_url",
+    [
+        ("simple2==2.0", "simple2-2.0.tar.gz.metadata"),
+        ("priority", "priority-1.0-py2.py3-none-any.whl.metadata"),
+    ],
+)
+def test_metadata_not_found(
+    download_local_html_index: Callable[..., Tuple[TestPipResult, Path]],
+    requirement_to_download: str,
+    expected_url: str,
+) -> None:
+    """Verify that if a data-dist-info-metadata attribute is provided, that pip will
+    fetch the .metadata file at the location specified by PEP 658, and error
+    if unavailable."""
+    result, _ = download_local_html_index(
+        [requirement_to_download],
+        allow_error=True,
+    )
+    assert result.returncode != 0
+    expected_re = re.escape(expected_url)
+    pattern = re.compile(
+        f"ERROR: 404 Client Error: FileNotFoundError for url:.*{expected_re}"
+    )
+    assert pattern.search(result.stderr), (pattern, result.stderr)
+
+
+def test_produces_error_for_mismatched_package_name_in_metadata(
+    download_local_html_index: Callable[..., Tuple[TestPipResult, Path]],
+) -> None:
+    """Verify that the package name from the metadata matches the requested package."""
+    result, _ = download_local_html_index(
+        ["simple2==3.0"],
+        allow_error=True,
+    )
+    assert result.returncode != 0
+    assert (
+        "simple2-3.0.tar.gz has inconsistent Name: expected 'simple2', but metadata "
+        "has 'not-simple2'"
+    ) in result.stdout
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    (
+        "requires-simple-extra==0.1",
+        "REQUIRES_SIMPLE-EXTRA==0.1",
+        "REQUIRES....simple-_-EXTRA==0.1",
+    ),
+)
+def test_canonicalizes_package_name_before_verifying_metadata(
+    download_local_html_index: Callable[..., Tuple[TestPipResult, Path]],
+    requirement: str,
+) -> None:
+    """Verify that the package name from the command line and the package's
+    METADATA are both canonicalized before comparison.
+
+    Regression test for https://github.com/pypa/pip/issues/12038
+    """
+    result, download_dir = download_local_html_index(
+        [requirement],
+        allow_error=True,
+    )
+    assert result.returncode == 0
+    assert os.listdir(download_dir) == [
+        "requires_simple_extra-0.1-py2.py3-none-any.whl",
+    ]

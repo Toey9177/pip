@@ -3,11 +3,11 @@ from typing import Optional
 
 import pytest
 
-from tests.lib import pyversion  # noqa: F401
 from tests.lib import (
     PipTestEnvironment,
     _change_test_package_version,
     _create_test_package,
+    pyversion,  # noqa: F401
 )
 from tests.lib.git_submodule_helpers import (
     _change_test_package_submodule,
@@ -79,7 +79,7 @@ def _make_version_pkg_url(
     Return a "git+file://" URL to the version_pkg test package.
 
     Args:
-      path: a tests.lib.path.Path object pointing to a Git repository
+      path: a pathlib.Path object pointing to a Git repository
         containing the version_pkg package.
       rev: an optional revision to install like a branch name, tag, or SHA.
     """
@@ -94,33 +94,35 @@ def _install_version_pkg_only(
     script: PipTestEnvironment,
     path: Path,
     rev: Optional[str] = None,
-    expect_stderr: bool = False,
+    allow_stderr_warning: bool = False,
 ) -> None:
     """
     Install the version_pkg package in editable mode (without returning
     the version).
 
     Args:
-      path: a tests.lib.path.Path object pointing to a Git repository
+      path: a pathlib.Path object pointing to a Git repository
         containing the package.
       rev: an optional revision to install like a branch name or tag.
     """
     version_pkg_url = _make_version_pkg_url(path, rev=rev)
-    script.pip("install", "-e", version_pkg_url, expect_stderr=expect_stderr)
+    script.pip(
+        "install", "-e", version_pkg_url, allow_stderr_warning=allow_stderr_warning
+    )
 
 
 def _install_version_pkg(
     script: PipTestEnvironment,
     path: Path,
     rev: Optional[str] = None,
-    expect_stderr: bool = False,
+    allow_stderr_warning: bool = False,
 ) -> str:
     """
     Install the version_pkg package in editable mode, and return the version
     installed.
 
     Args:
-      path: a tests.lib.path.Path object pointing to a Git repository
+      path: a pathlib.Path object pointing to a Git repository
         containing the package.
       rev: an optional revision to install like a branch name or tag.
     """
@@ -128,7 +130,7 @@ def _install_version_pkg(
         script,
         path,
         rev=rev,
-        expect_stderr=expect_stderr,
+        allow_stderr_warning=allow_stderr_warning,
     )
     result = script.run("version_pkg")
     version = result.stdout.strip()
@@ -184,7 +186,6 @@ def test_install_editable_from_git_with_https(
 
 
 @pytest.mark.network
-@pytest.mark.usefixtures("with_wheel")
 def test_install_noneditable_git(script: PipTestEnvironment) -> None:
     """
     Test installing from a non-editable git URL with a given tag.
@@ -227,7 +228,13 @@ def test_git_with_short_sha1_revisions(script: PipTestEnvironment) -> None:
         "HEAD~1",
         cwd=version_pkg_path,
     ).stdout.strip()[:7]
-    version = _install_version_pkg(script, version_pkg_path, rev=sha1)
+    version = _install_version_pkg(
+        script,
+        version_pkg_path,
+        rev=sha1,
+        # WARNING: Did not find branch or tag ..., assuming revision or ref.
+        allow_stderr_warning=True,
+    )
     assert "0.1" == version
 
 
@@ -273,6 +280,8 @@ def test_git_install_ref(script: PipTestEnvironment) -> None:
         script,
         version_pkg_path,
         rev="refs/foo/bar",
+        # WARNING: Did not find branch or tag ..., assuming revision or ref.
+        allow_stderr_warning=True,
     )
     assert "0.1" == version
 
@@ -294,6 +303,8 @@ def test_git_install_then_install_ref(script: PipTestEnvironment) -> None:
         script,
         version_pkg_path,
         rev="refs/foo/bar",
+        # WARNING: Did not find branch or tag ..., assuming revision or ref.
+        allow_stderr_warning=True,
     )
     assert "0.1" == version
 
@@ -381,7 +392,7 @@ def test_git_with_non_editable_unpacking(
     )
     result = script.pip(
         "install",
-        "--global-option=--version",
+        "--global-option=--quiet",
         local_url,
         allow_stderr_warning=True,
     )
@@ -438,7 +449,7 @@ def test_git_with_ambiguous_revs(script: PipTestEnvironment) -> None:
     assert "Could not find a tag or branch" not in result.stdout
     # it is 'version-pkg' instead of 'version_pkg' because
     # egg-link name is version-pkg.egg-link because it is a single .py module
-    result.assert_installed("version-pkg", with_files=[".git"])
+    result.assert_installed("version_pkg", with_files=[".git"])
 
 
 def test_editable__no_revision(script: PipTestEnvironment) -> None:
@@ -532,6 +543,11 @@ def test_reinstalling_works_with_editable_non_master_branch(
 
 # TODO(pnasrat) fix all helpers to do right things with paths on windows.
 @pytest.mark.skipif("sys.platform == 'win32'")
+@pytest.mark.xfail(
+    condition=True,
+    reason="Git submodule against file: is not working; waiting for a good solution",
+    run=True,
+)
 def test_check_submodule_addition(script: PipTestEnvironment) -> None:
     """
     Submodules are pulled in on install and updated on upgrade.
@@ -563,7 +579,6 @@ def test_check_submodule_addition(script: PipTestEnvironment) -> None:
     update_result.did_create(script.venv / "src/version-pkg/testpkg/static/testfile2")
 
 
-@pytest.mark.usefixtures("with_wheel")
 def test_install_git_branch_not_cached(script: PipTestEnvironment) -> None:
     """
     Installing git urls with a branch revision does not cause wheel caching.
@@ -579,7 +594,6 @@ def test_install_git_branch_not_cached(script: PipTestEnvironment) -> None:
     assert f"Successfully built {PKG}" in result.stdout, result.stdout
 
 
-@pytest.mark.usefixtures("with_wheel")
 def test_install_git_sha_cached(script: PipTestEnvironment) -> None:
     """
     Installing git urls with a sha revision does cause wheel caching.
